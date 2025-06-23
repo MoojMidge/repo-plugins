@@ -10,10 +10,11 @@
 
 from __future__ import absolute_import, division, unicode_literals
 
-import atexit
-import json
-import re
+from atexit import register as atexit_register
 from base64 import b64decode
+from functools import partial
+from json import loads as json_loads
+from re import compile as re_compile
 from weakref import proxy
 
 from .client import APICheck, YouTube
@@ -30,6 +31,7 @@ from .helper import (
     yt_subscriptions,
     yt_video,
 )
+from .helper.utils import channel_filter_split, update_duplicate_items
 from .youtube_exceptions import InvalidGrant, LoginException
 from ..kodion import AbstractProvider
 from ..kodion.constants import (
@@ -74,8 +76,8 @@ class Provider(AbstractProvider):
             yt_play.process,
         )
 
-        self.register_path(
-            '^/special/(?P<category>[^/]+)/?$',
+        self.on_specials_x = self.register_path(
+            '^/special/(?P<category>[^/]+)(?:/(?P<sub_category>[^/]+))?/?$',
             yt_specials.process,
         )
 
@@ -84,7 +86,7 @@ class Provider(AbstractProvider):
             yt_subscriptions.process,
         )
 
-        atexit.register(self.tear_down)
+        atexit_register(self.tear_down)
 
     @staticmethod
     def get_wizard_steps():
@@ -101,6 +103,10 @@ class Provider(AbstractProvider):
         ]
         return steps
 
+    @staticmethod
+    def pre_run_wizard_step(provider, context):
+        yt_setup_wizard.process_pre_run(context)
+
     def is_logged_in(self):
         return self._logged_in
 
@@ -114,7 +120,7 @@ class Provider(AbstractProvider):
                                 ' deprecated. Please use the'
                                 ' youtube_registration module instead')
             try:
-                dev_config = json.loads(_dev_config)
+                dev_config = json_loads(_dev_config)
             except ValueError:
                 context.log_error('Error loading developer key: |invalid json|')
         if not dev_config and addon_id and dev_configs:
@@ -234,8 +240,8 @@ class Provider(AbstractProvider):
                 )
                 self.reset_client()
 
-        num_access_tokens = sum(1 for token in access_tokens if token)
-        num_refresh_tokens = sum(1 for token in refresh_tokens if token)
+        num_access_tokens = len([1 for token in access_tokens if token])
+        num_refresh_tokens = len([1 for token in refresh_tokens if token])
         context.log_debug(
             'Access token count: |{0}|, refresh token count: |{1}|'
             .format(num_access_tokens, num_refresh_tokens)
@@ -249,11 +255,8 @@ class Provider(AbstractProvider):
                          configs=configs)
 
         with client:
-            if not refresh_tokens:
-                self._client = client
-
             # create new access tokens
-            elif num_access_tokens != num_refresh_tokens:
+            if num_refresh_tokens and num_access_tokens != num_refresh_tokens:
                 access_tokens = [None, None]
                 token_expiry = 0
                 try:
@@ -279,7 +282,7 @@ class Provider(AbstractProvider):
                             expiry=token_expiry,
                         )
                     else:
-                        raise InvalidGrant
+                        raise InvalidGrant('Failed to refresh access token(s)')
 
                 except (InvalidGrant, LoginException) as exc:
                     self.handle_exception(context, exc)
@@ -295,7 +298,7 @@ class Provider(AbstractProvider):
                         refresh_token=refresh_token,
                     )
 
-                num_access_tokens = sum(1 for token in access_tokens if token)
+                num_access_tokens = len([1 for token in access_tokens if token])
 
             if num_access_tokens and access_tokens[1]:
                 self._logged_in = True
@@ -312,13 +315,17 @@ class Provider(AbstractProvider):
         self._client = client
         return self._client
 
-    def get_resource_manager(self, context):
+    def get_resource_manager(self, context, progress_dialog=None):
         resource_manager = self._resource_manager
         if not resource_manager or resource_manager.context_changed(context):
-            new_resource_manager = ResourceManager(proxy(self), context)
+            new_resource_manager = ResourceManager(proxy(self),
+                                                   context,
+                                                   progress_dialog)
             if not resource_manager:
                 self._resource_manager = new_resource_manager
             return new_resource_manager
+        if progress_dialog:
+            resource_manager.update_progress_dialog(progress_dialog)
         return resource_manager
 
     @AbstractProvider.register_path('^/uri2addon/?$')
@@ -333,19 +340,276 @@ class Provider(AbstractProvider):
             listing = True
 
         if not uri:
-            return False
+            return False, None
 
         url_resolver = UrlResolver(context)
         resolved_url = url_resolver.resolve(uri)
+        if not resolved_url:
+            return False, None
+
         url_converter = UrlToItemConverter(flatten=True)
         url_converter.add_url(resolved_url, context)
         items = url_converter.get_items(provider=provider,
                                         context=context,
                                         skip_title=skip_title)
         if items:
-            return items if listing else items[0]
+            return (items if listing else items[0]), None
 
-        return False
+        return False, None
+
+    @AbstractProvider.register_path(
+        r'^/channel/(?P<channel_id>[^/]+)'
+        r'/playlists/?$')
+    @staticmethod
+    def on_channel_playlists(provider, context, re_match):
+        """
+        Lists all playlists of a channel.
+
+        plugin://plugin.video.youtube/channel/<CHANNEL_ID>/playlists/
+
+        * CHANNEL_ID: YouTube Channel ID
+        """
+        channel_id = re_match.group('channel_id')
+
+        params = context.get_params()
+        page_token = params.get('page_token', '')
+        incognito = params.get('incognito')
+        addon_id = params.get('addon_id')
+
+        new_params = {}
+        if incognito:
+            new_params['incognito'] = incognito
+        if addon_id:
+            new_params['addon_id'] = addon_id
+
+        resource_manager = provider.get_resource_manager(context)
+        playlists = resource_manager.get_related_playlists(channel_id)
+        uploads = playlists.get('uploads') if playlists else None
+        if uploads and uploads.startswith('UU'):
+            result = [
+                {
+                    'kind': 'youtube#playlist',
+                    'id': uploads,
+                    'snippet': {
+                        'channelId': channel_id,
+                        'title': context.localize('uploads'),
+                        'thumbnails': {'default': {
+                            'url': 'DefaultVideo.png',
+                        }},
+                    },
+                    '_available': True,
+                    '_partial': True,
+                },
+                {
+                    'kind': 'youtube#playlist',
+                    'id': uploads.replace('UU', 'UUSH', 1),
+                    'snippet': {
+                        'channelId': channel_id,
+                        'title': context.localize('shorts'),
+                        'thumbnails': {'default': {
+                            'url': '{media}/shorts.png',
+                        }},
+                    },
+                    '_partial': True,
+                },
+                {
+                    'kind': 'youtube#playlist',
+                    'id': uploads.replace('UU', 'UULV', 1),
+                    'snippet': {
+                        'channelId': channel_id,
+                        'title': context.localize('live'),
+                        'thumbnails': {'default': {
+                            'url': '{media}/live.png',
+                        }},
+                    },
+                    '_partial': True,
+                },
+            ]
+        else:
+            result = False
+
+        json_data = resource_manager.get_my_playlists(channel_id, page_token)
+        if not json_data:
+            return False, None
+
+        if result and 'items' in json_data:
+            result.extend(json_data['items'])
+            json_data['items'] = result
+        result = v3.response_to_items(provider, context, json_data)
+        options = {
+            provider.CONTENT_TYPE: {
+                'content_type': CONTENT.LIST_CONTENT,
+                'sub_type': None,
+                'category_label': None,
+            },
+        }
+        return result, options
+
+    @AbstractProvider.register_path(
+        r'^/channel/(?P<channel_id>[^/]+)'
+        r'/(?:live|playlist/(?P<playlist_id>UULV[^/]+))/?$'
+    )
+    @staticmethod
+    def on_channel_live(provider,
+                        context,
+                        re_match=None,
+                        channel_id=None,
+                        playlist_id=None):
+        """
+        List live streams for a given channel.
+
+        plugin://plugin.video.youtube/channel/<CHANNEL_ID>/live
+
+        or
+
+        plugin://plugin.video.youtube/channel/<CHANNEL_ID>/playlist/<PLAYLIST_ID>
+
+        * CHANNEL_ID: YouTube channel ID
+        * PLAYLIST_ID: YouTube live stream playlist ID beginning with UULV
+        """
+        resource_manager = provider.get_resource_manager(context)
+
+        if re_match:
+            channel_id = re_match.group('channel_id')
+            playlist_id = re_match.group('playlist_id')
+            if not playlist_id:
+                playlists = resource_manager.get_related_playlists(channel_id)
+                playlist_id = playlists.get('uploads') if playlists else None
+                if playlist_id and playlist_id.startswith('UU'):
+                    playlist_id = playlist_id.replace('UU', 'UULV', 1)
+        if not channel_id or not playlist_id:
+            return False, None
+
+        new_params = {
+            'channel_id': channel_id,
+            'playlist_id': playlist_id,
+        }
+        context.parse_params(new_params)
+
+        batch_id = (playlist_id, context.get_param('page_token') or 0)
+        json_data = resource_manager.get_playlist_items(batch_id=batch_id)
+        if not json_data:
+            return False, None
+
+        live_streams = provider.get_client(context).get_browse_videos(
+            channel_id=channel_id,
+            route='streams',
+            json_path={
+                'items': (
+                    'contents',
+                    'twoColumnBrowseResultsRenderer',
+                    'tabs',
+                    slice(None),
+                    'tabRenderer',
+                    lambda x: (
+                        x['content']
+                        if x['title'] == 'Live' else
+                        None
+                    ),
+                    'richGridRenderer',
+                    'contents',
+                    slice(None),
+                    'richItemRenderer',
+                    'content',
+                    'videoRenderer',
+                    lambda x: (
+                        x
+                        if (x[
+                            'thumbnailOverlays'
+                        ][
+                            0
+                        ][
+                            'thumbnailOverlayTimeStatusRenderer'
+                        ][
+                            'style'
+                        ]) == 'LIVE' else
+                        None
+                    ),
+                ),
+                'continuation': None,
+            },
+        )
+        if live_streams and 'items' in live_streams and 'items' in json_data:
+            live_streams['items'].extend(json_data['items'])
+            json_data['items'] = live_streams['items']
+
+        result = v3.response_to_items(
+            provider, context, json_data,
+            allow_duplicates=False,
+            item_filter={
+                'live_folder': True,
+            },
+        )
+        options = {
+            provider.CONTENT_TYPE: {
+                'content_type': CONTENT.VIDEO_CONTENT,
+                'sub_type': None,
+                'category_label': None,
+            },
+        }
+        return result, options
+
+    @AbstractProvider.register_path(
+        r'^/channel/(?P<channel_id>[^/]+)'
+        r'/(?:shorts|playlist/(?P<playlist_id>UUSH[^/]+))/?$'
+    )
+    @staticmethod
+    def on_channel_shorts(provider,
+                          context,
+                          re_match=None,
+                          channel_id=None,
+                          playlist_id=None):
+        """
+        List shorts for channel.
+
+        plugin://plugin.video.youtube/channel/<CHANNEL_ID>/shorts
+
+        or
+
+        plugin://plugin.video.youtube/channel/<CHANNEL_ID>/playlist/<PLAYLIST_ID>
+
+        * CHANNEL_ID: YouTube channel ID
+        * PLAYLIST_ID: YouTube live stream playlist ID beginning with UUSH
+        """
+        resource_manager = provider.get_resource_manager(context)
+
+        if re_match:
+            channel_id = re_match.group('channel_id')
+            playlist_id = re_match.group('playlist_id')
+            if not playlist_id:
+                playlists = resource_manager.get_related_playlists(channel_id)
+                playlist_id = playlists.get('uploads') if playlists else None
+                if playlist_id and playlist_id.startswith('UU'):
+                    playlist_id = playlist_id.replace('UU', 'UUSH', 1)
+        if not playlist_id:
+            return False, None
+
+        new_params = {
+            'playlist_id': playlist_id,
+        }
+        if channel_id:
+            new_params['channel_id'] = channel_id
+        context.parse_params(new_params)
+
+        batch_id = (playlist_id, context.get_param('page_token') or 0)
+        json_data = resource_manager.get_playlist_items(batch_id=batch_id)
+        if not json_data:
+            return False, None
+
+        result = v3.response_to_items(
+            provider, context, json_data,
+            item_filter={
+                'shorts': True,
+            },
+        )
+        options = {
+            provider.CONTENT_TYPE: {
+                'content_type': CONTENT.VIDEO_CONTENT,
+                'sub_type': None,
+                'category_label': None,
+            },
+        }
+        return result, options
 
     @AbstractProvider.register_path(
         r'^(?:/channel/(?P<channel_id>[^/]+))?'
@@ -365,156 +629,31 @@ class Provider(AbstractProvider):
         * CHANNEL_ID: ['mine'|YouTube Channel ID]
         * PLAYLIST_ID: YouTube Playlist ID
         """
-        context.set_content(CONTENT.VIDEO_CONTENT)
+        playlist_id = re_match.group('playlist_id')
+        new_params = {
+            'playlist_id': playlist_id,
+        }
+        channel_id = re_match.group('channel_id')
+        if channel_id:
+            new_params['channel_id'] = channel_id
+        context.parse_params(new_params)
+
         resource_manager = provider.get_resource_manager(context)
 
-        batch_id = (re_match.group('playlist_id'),
-                    context.get_param('page_token') or 0)
-
+        batch_id = (playlist_id, context.get_param('page_token') or 0)
         json_data = resource_manager.get_playlist_items(batch_id=batch_id)
         if not json_data:
-            return False
-        result = v3.response_to_items(provider, context, json_data[batch_id])
-        return result
+            return False, None
 
-    @AbstractProvider.register_path(
-        r'^/channel/(?P<channel_id>[^/]+)'
-        r'/playlists/?$')
-    @staticmethod
-    def on_channel_playlists(provider, context, re_match):
-        """
-        Lists all playlists of a channel.
-
-        plugin://plugin.video.youtube/channel/<CHANNEL_ID>/playlists/
-
-        * CHANNEL_ID: YouTube Channel ID
-        """
-        context.set_content(CONTENT.LIST_CONTENT)
-
-        channel_id = re_match.group('channel_id')
-
-        params = context.get_params()
-        page_token = params.get('page_token', '')
-        incognito = params.get('incognito')
-        addon_id = params.get('addon_id')
-
-        new_params = {}
-        if incognito:
-            new_params['incognito'] = incognito
-        if addon_id:
-            new_params['addon_id'] = addon_id
-
-        resource_manager = provider.get_resource_manager(context)
-        fanart = resource_manager.get_fanarts(
-            (channel_id,), force=True
-        ).get(channel_id)
-        playlists = resource_manager.get_related_playlists(channel_id)
-
-        playlist_id = playlists.get('uploads')
-        if playlist_id:
-            item_label = context.localize('uploads')
-            uploads = DirectoryItem(
-                context.get_ui().bold(item_label),
-                context.create_uri(
-                    ('channel', channel_id, 'playlist', playlist_id),
-                    new_params,
-                ),
-                image='{media}/playlist.png',
-                fanart=fanart,
-                category_label=item_label,
-                channel_id=channel_id,
-                playlist_id=playlist_id,
-            )
-
-            context_menu = [
-                menu_items.play_playlist(
-                    context, playlist_id
-                ),
-                menu_items.view_playlist(
-                    context, playlist_id
-                ),
-                menu_items.shuffle_playlist(
-                    context, playlist_id
-                ),
-            ]
-
-            if channel_id != 'mine':
-                context_menu.extend((
-                    menu_items.separator(),
-                    menu_items.bookmark_add(
-                        context, uploads
-                    ),
-                    # subscribe to the channel via the playlist item
-                    menu_items.subscribe_to_channel(
-                        context, channel_id,
-                    ) if provider.is_logged_in else None,
-                    # bookmark channel of the playlist
-                    menu_items.bookmark_add_channel(
-                        context, channel_id,
-                    )
-                ))
-
-            if context_menu:
-                uploads.add_context_menu(context_menu)
-
-            result = [uploads]
-        else:
-            result = False
-
-        json_data = provider.get_client(context).get_playlists_of_channel(
-            channel_id, page_token
-        )
-        if not json_data:
-            return result
-
-        if not result:
-            result = []
-        result.extend(v3.response_to_items(provider, context, json_data))
-        return result
-
-    @AbstractProvider.register_path(
-        r'^/channel/(?P<channel_id>[^/]+)'
-        r'/live/?$')
-    @staticmethod
-    def on_channel_live(provider, context, re_match):
-        """
-        List live streams for channel.
-
-        plugin://plugin.video.youtube/channel/<CHANNEL_ID>/live
-
-        * CHANNEL_ID: YouTube Channel ID
-        """
-        context.set_content(CONTENT.VIDEO_CONTENT)
-        result = []
-
-        channel_id = re_match.group('channel_id')
-        params = context.get_params()
-        page_token = params.get('page_token', '')
-
-        client = provider.get_client(context)
-        function_cache = context.get_function_cache()
-        resource_manager = provider.get_resource_manager(context)
-
-        playlists = function_cache.run(resource_manager.get_related_playlists,
-                                       function_cache.ONE_DAY,
-                                       channel_id=channel_id)
-        if playlists and 'uploads' in playlists:
-            json_data = function_cache.run(client.get_playlist_items,
-                                           function_cache.ONE_MINUTE * 5,
-                                           _refresh=params.get('refresh'),
-                                           playlist_id=playlists['uploads'],
-                                           page_token=page_token)
-            if not json_data:
-                return result
-
-            result.extend(v3.response_to_items(
-                provider, context, json_data,
-                item_filter={
-                    'live_folder': True,
-                },
-            ))
-
-        return result
+        result = v3.response_to_items(provider, context, json_data)
+        options = {
+            provider.CONTENT_TYPE: {
+                'content_type': CONTENT.VIDEO_CONTENT,
+                'sub_type': None,
+                'category_label': None,
+            },
+        }
+        return result, options
 
     @AbstractProvider.register_path(
         r'^/(?P<command>(channel|handle|user))'
@@ -532,11 +671,8 @@ class Provider(AbstractProvider):
         listitem_channel_id = context.get_listitem_property(CHANNEL_ID)
 
         client = provider.get_client(context)
-        localize = context.localize
         create_uri = context.create_uri
-        function_cache = context.get_function_cache()
         params = context.get_params()
-        ui = context.get_ui()
 
         command = re_match.group('command')
         identifier = re_match.group('identifier')
@@ -547,17 +683,13 @@ class Provider(AbstractProvider):
                 and listitem_channel_id
                 and listitem_channel_id.lower().startswith(('mine', 'uc'))):
             context.execute('ActivateWindow(Videos, {channel}, return)'.format(
-                channel=create_uri(('channel', listitem_channel_id))
+                channel=create_uri(
+                    (PATHS.CHANNEL, listitem_channel_id,),
+                )
             ))
 
         if command == 'channel' and not identifier:
             return False
-
-        context.set_content(CONTENT.VIDEO_CONTENT)
-
-        resource_manager = provider.get_resource_manager(context)
-
-        result = []
 
         """
         This is a helper routine that will retrieve the correct channel ID if we
@@ -571,126 +703,158 @@ class Provider(AbstractProvider):
             channel_id = identifier
         else:
             channel_id = None
-            identifier = {command: True, 'identifier': identifier}
 
         if not channel_id:
-            context.log_debug('Trying to get channel ID for |{0}|'.format(
-                identifier['identifier']
-            ))
-            json_data = function_cache.run(client.get_channel_by_identifier,
-                                           function_cache.ONE_DAY,
-                                           _refresh=params.get('refresh'),
-                                           **identifier)
-            if not json_data:
+            function_cache = context.get_function_cache()
+            channel_id = function_cache.run(
+                client.get_channel_by_identifier,
+                function_cache.ONE_MONTH,
+                _refresh=context.refresh_requested(),
+                **{
+                    command: True,
+                    'identifier': identifier,
+                }
+            )
+            if not channel_id:
                 return False
 
-            identifier = identifier['identifier']
-            # we correct the channel id based on the username
-            items = json_data.get('items', [])
-            if items:
-                channel_id = items[0]['id']
+        context.parse_params({
+            'channel_id': channel_id,
+        })
+
+        resource_manager = provider.get_resource_manager(context)
+        result = []
+        options = {
+            provider.CONTENT_TYPE: {
+                'content_type': CONTENT.VIDEO_CONTENT,
+                'sub_type': None,
+                'category_label': None,
+            },
+        }
+
+        playlists = resource_manager.get_related_playlists(channel_id)
+        uploads = playlists.get('uploads') if playlists else None
+        if uploads and not uploads.startswith('UU'):
+            uploads = None
+
+        if params.get('page', 1) == 1 and not params.get('hide_folders'):
+            v3_response = {
+                'kind': 'youtube#pluginListResponse',
+                'items': [
+                    {
+                        'kind': 'youtube#playlistFolder',
+                        'id': 'playlists',
+                        'snippet': {
+                            'channelId': channel_id,
+                            'title': context.localize('playlists'),
+                            'thumbnails': {'default': {
+                                'url': '{media}/playlist.png',
+                            }},
+                        },
+                        '_partial': True,
+                    } if not params.get('hide_playlists') else None,
+                    {
+                        'kind': 'youtube#searchFolder',
+                        'id': 'search',
+                        'snippet': {
+                            'channelId': channel_id,
+                            'title': context.localize('search'),
+                            'thumbnails': {'default': {
+                                'url': '{media}/search.png',
+                            }},
+                        },
+                        '_partial': True,
+                    } if not params.get('hide_search') else None,
+                    {
+                        'kind': 'youtube#playlist',
+                        'id': uploads.replace('UU', 'UUSH', 1),
+                        'snippet': {
+                            'channelId': channel_id,
+                            'title': context.localize('shorts'),
+                            'thumbnails': {'default': {
+                                'url': '{media}/shorts.png',
+                            }},
+                        },
+                        '_partial': True,
+                    } if uploads and not params.get('hide_shorts') else None,
+                    {
+                        'kind': 'youtube#playlist',
+                        'id': uploads.replace('UU', 'UULV', 1),
+                        'snippet': {
+                            'channelId': channel_id,
+                            'title': context.localize('live'),
+                            'thumbnails': {'default': {
+                                'url': '{media}/live.png',
+                            }},
+                        },
+                        '_partial': True,
+                    } if uploads and not params.get('hide_live') else None,
+                ],
+            }
+            result.extend(v3.response_to_items(provider, context, v3_response))
+
+        if uploads:
+            # The "UULF" videos playlist can only be used if videos in a channel
+            # are made public. Use "UU" all uploads playlist and filter instead
+            # if viewing personal channel.
+            if command != 'mine':
+                filtered_uploads = uploads.replace('UU', 'UULF', 1)
             else:
-                context.log_debug('Channel ID not found for |{0}|'.format(
-                    identifier
-                ))
+                filtered_uploads = None
+            while 1:
+                page_token = params.get('page_token')
+                if filtered_uploads:
+                    batch_id = (filtered_uploads, page_token or 0)
+                else:
+                    batch_id = (uploads, page_token or 0)
 
-        if not channel_id:
-            return False
-
-        fanart = resource_manager.get_fanarts(
-            (channel_id,), force=True
-        ).get(channel_id)
-
-        page = params.get('page', 1)
-        page_token = params.get('page_token', '')
-        incognito = params.get('incognito')
-        addon_id = params.get('addon_id')
-
-        new_params = {}
-        if incognito:
-            new_params['incognito'] = incognito
-        if addon_id:
-            new_params['addon_id'] = addon_id
-
-        hide_folders = params.get('hide_folders')
-
-        if page == 1 and not hide_folders:
-            hide_playlists = params.get('hide_playlists')
-            hide_search = params.get('hide_search')
-            hide_live = params.get('hide_live')
-
-            if not hide_playlists:
-                item_label = localize('playlists')
-                playlists_item = DirectoryItem(
-                    ui.bold(item_label),
-                    create_uri(
-                        ('channel', channel_id, 'playlists'),
-                        new_params,
-                    ),
-                    image='{media}/playlist.png',
-                    fanart=fanart,
-                    category_label=item_label,
-                    channel_id=channel_id,
+                json_data = resource_manager.get_playlist_items(
+                    batch_id=batch_id,
+                    defer_cache=False,
                 )
-                result.append(playlists_item)
+                if json_data:
+                    break
+                if filtered_uploads:
+                    filtered_uploads = None
+                    continue
+                return result, options
 
-            if not hide_search:
-                search_item = NewSearchItem(
-                    context, name=ui.bold(localize('search')),
-                    image='{media}/search.png',
-                    fanart=fanart,
-                    channel_id=channel_id,
-                    incognito=incognito,
-                    addon_id=addon_id,
+            context.parse_params({
+                'playlist_id': filtered_uploads or uploads,
+            })
+
+            if not filtered_uploads:
+                filler = partial(
+                    resource_manager.get_playlist_items,
+                    ids=(uploads,),
+                    defer_cache=False,
                 )
-                result.append(search_item)
-
-            if not hide_live:
-                item_label = localize('live')
-                live_item = DirectoryItem(
-                    ui.bold(item_label),
-                    create_uri(
-                        ('channel', channel_id, 'live'),
-                        new_params,
-                    ),
-                    image='{media}/live.png',
-                    fanart=fanart,
-                    category_label=item_label,
-                    channel_id=channel_id,
-                )
-                result.append(live_item)
-
-        playlists = function_cache.run(resource_manager.get_related_playlists,
-                                       function_cache.ONE_DAY,
-                                       channel_id=identifier)
-        if playlists and 'uploads' in playlists:
-            json_data = function_cache.run(client.get_playlist_items,
-                                           function_cache.ONE_MINUTE * 5,
-                                           _refresh=params.get('refresh'),
-                                           playlist_id=playlists['uploads'],
-                                           page_token=page_token)
-            if not json_data:
-                return result
+                json_data['_post_filler'] = filler
 
             result.extend(v3.response_to_items(
                 provider, context, json_data,
                 item_filter={
+                    'shorts': True,
                     'live': False,
                     'upcoming_live': False,
                 },
             ))
-
-        return result
+        return result, options
 
     @AbstractProvider.register_path('^/location/mine/?$')
     @staticmethod
-    def on_my_location(context, **_kwargs):
-        context.set_content(CONTENT.LIST_CONTENT)
-
+    def on_my_location(provider, context, **_kwargs):
         create_uri = context.create_uri
         localize = context.localize
         settings = context.get_settings()
         result = []
+        options = {
+            provider.CONTENT_TYPE: {
+                'content_type': CONTENT.LIST_CONTENT,
+                'sub_type': None,
+                'category_label': None,
+            },
+        }
 
         # search
         search_item = SearchItem(
@@ -705,7 +869,7 @@ class Provider(AbstractProvider):
             live_events_item = DirectoryItem(
                 localize('live.completed'),
                 create_uri(
-                    ('special', 'completed_live'),
+                    PATHS.LIVE_VIDEOS_COMPLETED,
                     params={'location': True},
                 ),
                 image='{media}/live.png',
@@ -717,7 +881,7 @@ class Provider(AbstractProvider):
             live_events_item = DirectoryItem(
                 localize('live.upcoming'),
                 create_uri(
-                    ('special', 'upcoming_live'),
+                    PATHS.LIVE_VIDEOS_UPCOMING,
                     params={'location': True},
                 ),
                 image='{media}/live.png',
@@ -728,14 +892,14 @@ class Provider(AbstractProvider):
         live_events_item = DirectoryItem(
             localize('live'),
             create_uri(
-                ('special', 'live'),
+                PATHS.LIVE_VIDEOS,
                 params={'location': True},
             ),
             image='{media}/live.png',
         )
         result.append(live_events_item)
 
-        return result
+        return result, options
 
     @AbstractProvider.register_path('^/users/(?P<action>[^/]+)/?$')
     @staticmethod
@@ -769,10 +933,18 @@ class Provider(AbstractProvider):
             yt_login.process(mode, provider, context)
         return True
 
-    def _search_channel_or_playlist(self, context, identifier):
-        if re.match(r'U[CU][0-9a-zA-Z_\-]{20,24}', identifier):
+    def _search_channel_or_playlist(self,
+                                    context,
+                                    identifier,
+                                    channel_re=re_compile(
+                                        r'U[CU][0-9a-zA-Z_\-]{20,24}'
+                                    ),
+                                    playlist_re=re_compile(
+                                        r'[OP]L[0-9a-zA-Z_\-]{30,40}'
+                                    )):
+        if channel_re.match(identifier):
             json_data = self.get_client(context).get_channels(identifier)
-        elif re.match(r'[OP]L[0-9a-zA-Z_\-]{30,40}', identifier):
+        elif playlist_re.match(identifier):
             json_data = self.get_client(context).get_playlists(identifier)
         else:
             return None
@@ -781,39 +953,53 @@ class Provider(AbstractProvider):
             return v3.response_to_items(self, context, json_data)
         return None
 
-    def on_search_run(self, context, query):
-        data_cache = context.get_data_cache()
-        data_cache.del_item('search_query')
+    def on_search_run(self, context, query=None):
+        params = context.get_params()
+        if query is None:
+            query = to_unicode(params.get('q', ''))
 
         # Search by url to access unlisted videos
         if query.startswith(('https://', 'http://')):
             return self.on_uri2addon(provider=self, context=context, uri=query)
         if context.is_plugin_path(query):
-            return UriItem(query)
+            return UriItem(query), {
+                self.CACHE_TO_DISC: False,
+                self.FALLBACK: False,
+            }
 
         result = self._search_channel_or_playlist(context, query)
         if result:  # found a channel or playlist matching search query
-            return result
+            return result, {
+                self.CACHE_TO_DISC: False,
+                self.FALLBACK: False,
+                self.CONTENT_TYPE: {
+                    'content_type': CONTENT.LIST_CONTENT,
+                    'sub_type': None,
+                    'category_label': query,
+                },
+            }
         result = []
 
-        context.set_param('q', query)
-        context.set_param('category_label', query)
-
-        params = context.get_params()
         channel_id = params.get('channel_id') or params.get('channelId')
         event_type = params.get('event_type') or params.get('eventType')
-        hide_folders = params.get('hide_folders')
         location = params.get('location')
-        page = params.get('page', 1)
         page_token = params.get('page_token') or params.get('pageToken') or ''
         search_type = params.get('search_type', 'video') or params.get('type')
 
-        if search_type == 'video':
-            context.set_content(CONTENT.VIDEO_CONTENT)
-        else:
-            context.set_content(CONTENT.LIST_CONTENT)
+        options = {
+            self.CACHE_TO_DISC: False,
+            self.CONTENT_TYPE: {
+                'content_type': (
+                    CONTENT.VIDEO_CONTENT
+                    if search_type == 'video' else
+                    CONTENT.LIST_CONTENT
+                ),
+                'sub_type': None,
+                'category_label': query,
+            },
+        }
 
-        if not hide_folders and page == 1:
+        if params.get('page', 1) == 1 and not params.get('hide_folders'):
             if event_type or search_type != 'video':
                 video_params = dict(params,
                                     search_type='video',
@@ -909,17 +1095,15 @@ class Provider(AbstractProvider):
         search_params, json_data = function_cache.run(
             self.get_client(context).search_with_params,
             function_cache.ONE_MINUTE * 10,
-            _refresh=params.get('refresh'),
+            _refresh=context.refresh_requested(),
             params=search_params,
         )
         if not json_data:
-            return False
+            return False, None
 
-        # Store current search query for Kodi window history navigation
-        if not params.get('incognito'):
-            if not params.get('channel_id'):
-                context.get_search_history().add_item(search_params)
-            data_cache.set_item('search_query', query)
+        # Store current search query
+        if not params.get('incognito') and not params.get('channel_id'):
+            context.get_search_history().add_item(search_params)
 
         result.extend(v3.response_to_items(
             self, context, json_data,
@@ -929,7 +1113,7 @@ class Provider(AbstractProvider):
                 'live': False,
             },
         ))
-        return result
+        return result, options
 
     @AbstractProvider.register_path('^/config/(?P<action>[^/]+)/?$')
     @staticmethod
@@ -937,7 +1121,7 @@ class Provider(AbstractProvider):
         action = re_match.group('action')
         if action == 'setup_wizard':
             provider.run_wizard(context)
-            return False, {provider.RESULT_FALLBACK: False}
+            return False, {provider.FALLBACK: False}
         return UriItem('script://{addon},config/{action}'.format(
             addon=ADDON_ID, action=action
         ))
@@ -947,44 +1131,53 @@ class Provider(AbstractProvider):
         '/(?P<command>add|remove)/?$'
     )
     @staticmethod
-    def on_manage_my_subscription_filter(context, re_match):
+    def on_manage_my_subscription_filter(context, re_match, **_kwargs):
         settings = context.get_settings()
         ui = context.get_ui()
 
-        channel = context.get_param('item_name')
+        channel_name = context.get_param('item_name')
         command = re_match.group('command')
-        if not channel or not command:
-            return
+        if not channel_name or not command:
+            return False, None
 
-        filter_enabled = settings.get_bool('youtube.folder.my_subscriptions_filtered.show', False)
-        if not filter_enabled:
-            return
+        if not settings.subscriptions_filter_enabled():
+            return False, None
 
-        channel_name = channel.lower()
-        channel_name = channel_name.replace(',', '')
-
-        filter_string = settings.get_string('youtube.filter.my_subscriptions_filtered.list', '')
-        filter_string = filter_string.replace(', ', ',')
-        filter_list = filter_string.split(',')
-        filter_list = [x.lower() for x in filter_list]
+        filter_string, filters_set, custom_filters = channel_filter_split(
+            settings.subscriptions_filter()
+        )
 
         if command == 'add':
-            if channel_name not in filter_list:
-                filter_list.append(channel_name)
-        elif command == 'remove' and channel_name in filter_list:
-            filter_list = [chan_name for chan_name in filter_list if chan_name != channel_name]
+            num_filters = len(filters_set)
+            filters_set.add(channel_name)
+            if len(filters_set) == num_filters:
+                return False, None
+        elif command == 'remove':
+            try:
+                filters_set.remove(channel_name)
+            except KeyError:
+                return False, None
+        else:
+            return False, None
 
-        modified_string = ','.join(filter_list).lstrip(',')
-        if filter_string != modified_string:
-            settings.set_string('youtube.filter.my_subscriptions_filtered.list', modified_string)
-            message = ''
-            if command == 'add':
-                message = context.localize('my_subscriptions.filter.added')
-            elif command == 'remove':
-                message = context.localize('my_subscriptions.filter.removed')
-            if message:
-                ui.show_notification(message=message)
-        ui.refresh_container()
+        filter_list = list(filters_set)
+        if custom_filters:
+            filter_list.extend([
+                ''.join([
+                    '{' + part + '}'
+                    for part in condition
+                ])
+                for custom_filter in custom_filters
+                for condition in custom_filter
+            ])
+        settings.subscriptions_filter(filter_list)
+
+        ui.show_notification(context.localize(
+            'my_subscriptions.filter.added'
+            if command == 'add' else
+            'my_subscriptions.filter.removed'
+        ))
+        return True, None
 
     @AbstractProvider.register_path(
         r'^/maintenance'
@@ -1015,7 +1208,7 @@ class Provider(AbstractProvider):
             refresh_tokens = access_manager.get_refresh_token()
             success = True
             if any(refresh_tokens):
-                for refresh_token in set(refresh_tokens):
+                for refresh_token in frozenset(refresh_tokens):
                     try:
                         if refresh_token:
                             client.revoke(refresh_token)
@@ -1027,6 +1220,9 @@ class Provider(AbstractProvider):
             )
             ui.refresh_container()
             ui.show_notification(localize('succeeded' if success else 'failed'))
+        else:
+            success = False
+        return success, None
 
     @AbstractProvider.register_path('^/api/update/?$')
     @staticmethod
@@ -1079,25 +1275,26 @@ class Provider(AbstractProvider):
             if not client_secret:
                 missing_list.append(localize('api.secret'))
                 log_list.append('Secret')
-            ui.show_notification(localize('api.personal.failed') % ', '.join(missing_list))
-            context.log_debug('Failed to enable personal API keys. Missing: %s' % ', '.join(log_list))
+            ui.show_notification(localize('api.personal.failed')
+                                 % ', '.join(missing_list))
+            context.log_error('Failed to enable personal API keys. Missing: %s'
+                              % ', '.join(log_list))
 
     @staticmethod
     def on_playback_history(provider, context, re_match):
         params = context.get_params()
         command = re_match.group('command')
         if not command:
-            return False
+            return False, None
 
         localize = context.localize
         playback_history = context.get_playback_history()
         ui = context.get_ui()
 
         if command in {'list', 'play'}:
-            context.set_content(CONTENT.VIDEO_CONTENT, sub_type='history')
             items = playback_history.get_items()
             if not items:
-                return True
+                return True, None
 
             v3_response = {
                 'kind': 'youtube#videoListResponse',
@@ -1129,14 +1326,21 @@ class Provider(AbstractProvider):
                     action='play',
                     play_from='start',
                 )
-            return video_items
+            options = {
+                provider.CONTENT_TYPE: {
+                    'content_type': CONTENT.VIDEO_CONTENT,
+                    'sub_type': 'history',
+                    'category_label': None,
+                },
+            }
+            return video_items, options
 
         if command == 'clear':
             if not ui.on_yes_no_input(
                     localize('history.clear'),
                     localize('history.clear.check')
             ):
-                return False, {provider.RESULT_FALLBACK: False}
+                return False, {provider.FALLBACK: False}
 
             playback_history.clear()
             ui.refresh_container()
@@ -1159,7 +1363,7 @@ class Provider(AbstractProvider):
                     localize('content.remove'),
                     localize('content.remove.check') % video_name,
             ):
-                return False, {provider.RESULT_FALLBACK: False}
+                return False, {provider.FALLBACK: False}
 
             playback_history.del_item(video_id)
             ui.refresh_container()
@@ -1213,10 +1417,12 @@ class Provider(AbstractProvider):
         logged_in = provider.is_logged_in()
         # _.get_my_playlists()
 
-        # context.set_content(CONTENT.LIST_CONTENT)
-        context.set_param('category_label', localize('youtube'))
-
         result = []
+        options = {
+            provider.CONTENT_TYPE: {
+                'category_label': localize('youtube'),
+            },
+        }
 
         # sign in
         if not logged_in and settings_bool('youtube.folder.sign.in.show', True):
@@ -1235,7 +1441,7 @@ class Provider(AbstractProvider):
             item_label = localize('my_subscriptions')
             my_subscriptions_item = DirectoryItem(
                 bold(item_label),
-                create_uri(('special', 'my_subscriptions')),
+                create_uri(PATHS.MY_SUBSCRIPTIONS),
                 image='{media}/new_uploads.png',
                 category_label=item_label,
             )
@@ -1245,7 +1451,7 @@ class Provider(AbstractProvider):
             # my subscriptions filtered
             my_subscriptions_filtered_item = DirectoryItem(
                 localize('my_subscriptions.filtered'),
-                create_uri(('special', 'my_subscriptions_filtered')),
+                create_uri(PATHS.MY_SUBSCRIPTIONS_FILTERED),
                 image='{media}/new_uploads.png',
             )
             result.append(my_subscriptions_filtered_item)
@@ -1256,10 +1462,11 @@ class Provider(AbstractProvider):
         local_history = settings.use_local_history()
 
         # Home / Recommendations
-        if logged_in and settings_bool('youtube.folder.recommendations.show', True):
+        if (logged_in
+                and settings_bool('youtube.folder.recommendations.show', True)):
             recommendations_item = DirectoryItem(
                 localize('recommendations'),
-                create_uri(('special', 'recommendations')),
+                create_uri(PATHS.RECOMMENDATIONS),
                 image='{media}/home.png',
             )
             result.append(recommendations_item)
@@ -1269,7 +1476,7 @@ class Provider(AbstractProvider):
             if history_id or local_history:
                 related_item = DirectoryItem(
                     localize('related_videos'),
-                    create_uri(('special', 'related_videos')),
+                    create_uri(PATHS.RELATED_VIDEOS),
                     image='{media}/related_videos.png',
                 )
                 result.append(related_item)
@@ -1278,7 +1485,7 @@ class Provider(AbstractProvider):
         if settings_bool('youtube.folder.popular_right_now.show', True):
             trending_item = DirectoryItem(
                 localize('trending'),
-                create_uri(('special', 'popular_right_now')),
+                create_uri(PATHS.TRENDING),
                 image='{media}/trending.png',
             )
             result.append(trending_item)
@@ -1308,7 +1515,8 @@ class Provider(AbstractProvider):
             result.append(quick_search_incognito_item)
 
         # my location
-        if settings_bool('youtube.folder.my_location.show', True) and settings.get_location():
+        if (settings_bool('youtube.folder.my_location.show', True)
+                and settings.get_location()):
             my_location_item = DirectoryItem(
                 localize('my_location'),
                 create_uri(('location', 'mine')),
@@ -1320,7 +1528,7 @@ class Provider(AbstractProvider):
         if logged_in and settings_bool('youtube.folder.my_channel.show', True):
             my_channel_item = DirectoryItem(
                 localize('my_channel'),
-                create_uri(('channel', 'mine')),
+                create_uri((PATHS.CHANNEL, 'mine')),
                 image='{media}/user.png',
             )
             result.append(my_channel_item)
@@ -1330,11 +1538,16 @@ class Provider(AbstractProvider):
             if watch_later_id:
                 watch_later_item = DirectoryItem(
                     localize('watch_later'),
-                    create_uri(('channel', 'mine', 'playlist', watch_later_id)),
+                    create_uri(
+                        (PATHS.CHANNEL, 'mine', 'playlist', watch_later_id,),
+                    ),
                     image='{media}/watch_later.png',
                 )
                 context_menu = [
                     menu_items.play_playlist(
+                        context, watch_later_id
+                    ),
+                    menu_items.play_playlist_recently_added(
                         context, watch_later_id
                     ),
                     menu_items.view_playlist(
@@ -1357,11 +1570,11 @@ class Provider(AbstractProvider):
                     menu_items.separator(),
                     menu_items.play_all_from(
                         context,
-                        route=PATHS.WATCH_LATER,
+                        path=PATHS.WATCH_LATER,
                     ),
                     menu_items.play_all_from(
                         context,
-                        route=PATHS.WATCH_LATER,
+                        path=PATHS.WATCH_LATER,
                         order='shuffle',
                     ),
                 ]
@@ -1369,18 +1582,24 @@ class Provider(AbstractProvider):
                 result.append(watch_later_item)
 
         # liked videos
-        if logged_in and settings_bool('youtube.folder.liked_videos.show', True):
+        if (logged_in
+                and settings_bool('youtube.folder.liked_videos.show', True)):
             resource_manager = provider.get_resource_manager(context)
             playlists = resource_manager.get_related_playlists('mine')
             if playlists and 'likes' in playlists:
-                liked_list_id = playlists['likes']
+                liked_list_id = playlists['likes'] or 'LL'
                 liked_videos_item = DirectoryItem(
                     localize('video.liked'),
-                    create_uri(('channel', 'mine', 'playlist', liked_list_id)),
+                    create_uri(
+                        (PATHS.CHANNEL, 'mine', 'playlist', liked_list_id,),
+                    ),
                     image='{media}/likes.png',
                 )
                 context_menu = [
                     menu_items.play_playlist(
+                        context, liked_list_id
+                    ),
+                    menu_items.play_playlist_recently_added(
                         context, liked_list_id
                     ),
                     menu_items.view_playlist(
@@ -1394,10 +1613,11 @@ class Provider(AbstractProvider):
                 result.append(liked_videos_item)
 
         # disliked videos
-        if logged_in and settings_bool('youtube.folder.disliked_videos.show', True):
+        if (logged_in
+                and settings_bool('youtube.folder.disliked_videos.show', True)):
             disliked_videos_item = DirectoryItem(
                 localize('video.disliked'),
-                create_uri(('special', 'disliked_videos')),
+                create_uri(PATHS.DISLIKED_VIDEOS),
                 image='{media}/dislikes.png',
             )
             result.append(disliked_videos_item)
@@ -1407,11 +1627,16 @@ class Provider(AbstractProvider):
             if history_id:
                 watch_history_item = DirectoryItem(
                     localize('history'),
-                    create_uri(('channel', 'mine', 'playlist', history_id)),
+                    create_uri(
+                        (PATHS.CHANNEL, 'mine', 'playlist', history_id,),
+                    ),
                     image='{media}/history.png',
                 )
                 context_menu = [
                     menu_items.play_playlist(
+                        context, history_id
+                    ),
+                    menu_items.play_playlist_recently_added(
                         context, history_id
                     ),
                     menu_items.view_playlist(
@@ -1436,11 +1661,11 @@ class Provider(AbstractProvider):
                     menu_items.separator(),
                     menu_items.play_all_from(
                         context,
-                        route=PATHS.HISTORY,
+                        path=PATHS.HISTORY,
                     ),
                     menu_items.play_all_from(
                         context,
-                        route=PATHS.HISTORY,
+                        path=PATHS.HISTORY,
                         order='shuffle',
                     ),
                 ]
@@ -1451,7 +1676,9 @@ class Provider(AbstractProvider):
         if logged_in and settings_bool('youtube.folder.playlists.show', True):
             playlists_item = DirectoryItem(
                 localize('playlists'),
-                create_uri(('channel', 'mine', 'playlists')),
+                create_uri(
+                    (PATHS.CHANNEL, 'mine', 'playlists',),
+                ),
                 image='{media}/playlist.png',
             )
             result.append(playlists_item)
@@ -1467,7 +1694,8 @@ class Provider(AbstractProvider):
         #     result.append(playlists_item)
 
         # subscriptions
-        if logged_in and settings_bool('youtube.folder.subscriptions.show', True):
+        if (logged_in
+                and settings_bool('youtube.folder.subscriptions.show', True)):
             subscriptions_item = DirectoryItem(
                 localize('subscriptions'),
                 create_uri(('subscriptions', 'list')),
@@ -1489,11 +1717,11 @@ class Provider(AbstractProvider):
                 menu_items.separator(),
                 menu_items.play_all_from(
                     context,
-                    route=PATHS.BOOKMARKS,
+                    path=PATHS.BOOKMARKS,
                 ),
                 menu_items.play_all_from(
                     context,
-                    route=PATHS.BOOKMARKS,
+                    path=PATHS.BOOKMARKS,
                     order='shuffle',
                 ),
             ]
@@ -1501,7 +1729,8 @@ class Provider(AbstractProvider):
             result.append(bookmarks_item)
 
         # browse channels
-        if logged_in and settings_bool('youtube.folder.browse_channels.show', True):
+        if (logged_in
+                and settings_bool('youtube.folder.browse_channels.show', True)):
             browse_channels_item = DirectoryItem(
                 localize('browse_channels'),
                 create_uri(('special', 'browse_channels')),
@@ -1513,7 +1742,7 @@ class Provider(AbstractProvider):
         if settings_bool('youtube.folder.completed.live.show', True):
             live_events_item = DirectoryItem(
                 localize('live.completed'),
-                create_uri(('special', 'completed_live')),
+                create_uri(PATHS.LIVE_VIDEOS_COMPLETED),
                 image='{media}/live.png',
             )
             result.append(live_events_item)
@@ -1522,7 +1751,7 @@ class Provider(AbstractProvider):
         if settings_bool('youtube.folder.upcoming.live.show', True):
             live_events_item = DirectoryItem(
                 localize('live.upcoming'),
-                create_uri(('special', 'upcoming_live')),
+                create_uri(PATHS.LIVE_VIDEOS_UPCOMING),
                 image='{media}/live.png',
             )
             result.append(live_events_item)
@@ -1531,7 +1760,7 @@ class Provider(AbstractProvider):
         if settings_bool('youtube.folder.live.show', True):
             live_events_item = DirectoryItem(
                 localize('live'),
-                create_uri(('special', 'live')),
+                create_uri(PATHS.LIVE_VIDEOS),
                 image='{media}/live.png',
             )
             result.append(live_events_item)
@@ -1574,21 +1803,20 @@ class Provider(AbstractProvider):
             )
             result.append(settings_menu_item)
 
-        return result
+        return result, options
 
     @staticmethod
     def on_bookmarks(provider, context, re_match):
         params = context.get_params()
         command = re_match.group('command')
         if not command:
-            return False
+            return False, None
 
         if command in {'list', 'play'}:
-            context.set_content(CONTENT.VIDEO_CONTENT)
             bookmarks_list = context.get_bookmarks_list()
             items = bookmarks_list.get_items()
             if not items:
-                return True
+                return True, None
 
             v3_response = {
                 'kind': 'youtube#pluginListResponse',
@@ -1602,7 +1830,7 @@ class Provider(AbstractProvider):
                     elif isinstance(old_item, BaseItem):
                         bookmark_timestamp = old_item.get_bookmark_timestamp()
                     else:
-                        return
+                        return True
 
                     if new_item.available:
                         new_item.bookmark_id = _id
@@ -1614,14 +1842,15 @@ class Provider(AbstractProvider):
                             bookmark_timestamp,
                         )
                     else:
-                        new_item.__dict__.update(old_item.__dict__)
+                        update_duplicate_items(old_item, [new_item])
                         new_item.bookmark_id = _id
                         new_item.set_bookmark_timestamp(bookmark_timestamp)
                         new_item.available = False
                         new_item.playable = False
-                        new_item.set_title(context.get_ui().color(
-                            'AA808080', new_item.get_title()
+                        new_item.set_name(context.get_ui().color(
+                            'AA808080', new_item.get_name()
                         ))
+                    return True
 
                 return _update
 
@@ -1631,9 +1860,9 @@ class Provider(AbstractProvider):
                     kind = 'youtube#channel'
                     yt_id = item_id
                     item_name = ''
-                    partial = True
+                    partial_result = True
                 elif isinstance(item, BaseItem):
-                    partial = False
+                    partial_result = False
 
                     if isinstance(item, VideoItem):
                         kind = 'youtube#video'
@@ -1650,7 +1879,7 @@ class Provider(AbstractProvider):
                     kind = None
                     yt_id = None
                     item_name = ''
-                    partial = False
+                    partial_result = False
 
                 if not yt_id:
                     if isinstance(item, BaseItem):
@@ -1664,7 +1893,7 @@ class Provider(AbstractProvider):
                                 to_delete = True
                                 continue
                             kind = 'youtube#' + kind
-                            partial = True
+                            partial_result = True
                             break
                         else:
                             if to_delete:
@@ -1676,7 +1905,7 @@ class Provider(AbstractProvider):
                 item = {
                     'kind': kind,
                     'id': yt_id,
-                    '_partial': partial,
+                    '_partial': partial_result,
                     '_context_menu': {
                         'context_menu': (
                             menu_items.bookmark_remove(
@@ -1701,7 +1930,14 @@ class Provider(AbstractProvider):
                     action='play',
                     play_from='start',
                 )
-            return bookmarks
+            options = {
+                provider.CONTENT_TYPE: {
+                    'content_type': CONTENT.VIDEO_CONTENT,
+                    'sub_type': None,
+                    'category_label': None,
+                },
+            }
+            return bookmarks, options
 
         ui = context.get_ui()
         localize = context.localize
@@ -1711,7 +1947,7 @@ class Provider(AbstractProvider):
                     context.localize('bookmarks.clear'),
                     localize('bookmarks.clear.check')
             ):
-                return False, {provider.RESULT_FALLBACK: False}
+                return False, {provider.FALLBACK: False}
 
             context.get_bookmarks_list().clear()
             ui.refresh_container()
@@ -1745,10 +1981,10 @@ class Provider(AbstractProvider):
                     localize('content.remove'),
                     localize('content.remove.check') % bookmark_name,
             ):
-                return False, {provider.RESULT_FALLBACK: False}
+                return False, {provider.FALLBACK: False}
 
             context.get_bookmarks_list().del_item(item_id)
-            context.get_ui().refresh_container()
+            ui.refresh_container()
 
             ui.show_notification(
                 localize('removed') % bookmark_name,
@@ -1764,16 +2000,15 @@ class Provider(AbstractProvider):
         params = context.get_params()
         command = re_match.group('command')
         if not command:
-            return False
+            return False, None
 
         localize = context.localize
         ui = context.get_ui()
 
         if command in {'list', 'play'}:
-            context.set_content(CONTENT.VIDEO_CONTENT, sub_type='watch_later')
             items = context.get_watch_later_list().get_items()
             if not items:
-                return True
+                return True, None
 
             v3_response = {
                 'kind': 'youtube#videoListResponse',
@@ -1805,14 +2040,21 @@ class Provider(AbstractProvider):
                     action='play',
                     play_from='start',
                 )
-            return video_items
+            options = {
+                provider.CONTENT_TYPE: {
+                    'content_type': CONTENT.VIDEO_CONTENT,
+                    'sub_type': 'watch_later',
+                    'category_label': None,
+                },
+            }
+            return video_items, options
 
         if command == 'clear':
             if not ui.on_yes_no_input(
                     localize('watch_later.clear'),
                     localize('watch_later.clear.check')
             ):
-                return False, {provider.RESULT_FALLBACK: False}
+                return False, {provider.FALLBACK: False}
 
             context.get_watch_later_list().clear()
             ui.refresh_container()
@@ -1841,7 +2083,7 @@ class Provider(AbstractProvider):
                     localize('content.remove'),
                     localize('content.remove.check') % video_name,
             ):
-                return False, {provider.RESULT_FALLBACK: False}
+                return False, {provider.FALLBACK: False}
 
             context.get_watch_later_list().del_item(video_id)
             ui.refresh_container()

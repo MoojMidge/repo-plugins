@@ -10,7 +10,7 @@
 
 from __future__ import absolute_import, division, unicode_literals
 
-import re
+from re import compile as re_compile
 
 from ...kodion.compatibility import parse_qsl, unescape, urlencode, urlsplit
 from ...kodion.network import BaseRequestsClass
@@ -53,10 +53,10 @@ class AbstractResolver(BaseRequestsClass):
 
 
 class YouTubeResolver(AbstractResolver):
-    _RE_CHANNEL_URL = re.compile(r'<meta property="og:url" content="'
+    _RE_CHANNEL_URL = re_compile(r'<meta property="og:url" content="'
                                  r'(?P<channel_url>[^"]+)'
                                  r'">')
-    _RE_CLIP_DETAILS = re.compile(r'(<meta property="og:video:url" content="'
+    _RE_CLIP_DETAILS = re_compile(r'(<meta property="og:video:url" content="'
                                   r'(?P<video_url>[^"]+)'
                                   r'">)'
                                   r'|("startTimeMs":"(?P<start_time>\d+)")'
@@ -130,7 +130,7 @@ class YouTubeResolver(AbstractResolver):
                                 # consent redirect
                                 cookies={'SOCS': 'CAISAiAD'},
                                 allow_redirects=True)
-        if not response or not response.ok:
+        if response is None or response.status_code >= 400:
             return url
 
         if path.startswith('/clip'):
@@ -162,11 +162,11 @@ class YouTubeResolver(AbstractResolver):
                 if num_matched != 7:
                     continue
 
-                params.update({
-                    'clip': True,
-                    'start': start_time,
-                    'end': end_time,
-                })
+                params.update((
+                    ('clip', True),
+                    ('start', start_time),
+                    ('end', end_time),
+                ))
                 return url_components._replace(query=urlencode(params)).geturl()
 
         elif path == '/watch_videos':
@@ -194,7 +194,8 @@ class YouTubeResolver(AbstractResolver):
                     return url_components._replace(
                         query=urlencode(params)
                     ).geturl()
-                return url
+                if url != 'undefined':
+                    return url
 
         return response.url
 
@@ -217,7 +218,7 @@ class CommonResolver(AbstractResolver):
                                 method=method,
                                 headers=self._HEADERS,
                                 allow_redirects=True)
-        if not response or not response.ok:
+        if response is None or response.status_code >= 400:
             return url
         return response.url
 
@@ -254,8 +255,8 @@ class UrlResolver(object):
         resolved_url = function_cache.run(
             self._resolve,
             function_cache.ONE_DAY,
-            _refresh=self._context.get_param('refresh'),
-            url=url
+            _refresh=self._context.refresh_requested(),
+            url=url,
         )
         if not resolved_url or resolved_url == '/':
             return url

@@ -50,6 +50,9 @@ class AbstractContextUI(object):
                           time_ms=5000, audible=True):
         raise NotImplementedError()
 
+    def on_busy(self):
+        raise NotImplementedError()
+
     @staticmethod
     def refresh_container():
         """

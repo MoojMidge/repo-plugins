@@ -18,6 +18,9 @@ from ..constants import (
     CHECK_SETTINGS,
     CONTAINER_FOCUS,
     PATHS,
+    PLAYBACK_STOPPED,
+    PLAYER_VIDEO_ID,
+    PLAY_FORCED,
     PLUGIN_WAKEUP,
     REFRESH_CONTAINER,
     RELOAD_ACCESS_MANAGER,
@@ -57,25 +60,52 @@ class ServiceMonitor(xbmc.Monitor):
         super(ServiceMonitor, self).__init__()
 
     @staticmethod
+    def busy_dialog_active(all_modals=False, dialog_ids=frozenset((
+            10100,  # WINDOW_DIALOG_YES_NO
+            10101,  # WINDOW_DIALOG_PROGRESS
+            10103,  # WINDOW_DIALOG_KEYBOARD
+            10109,  # WINDOW_DIALOG_NUMERIC
+            10138,  # WINDOW_DIALOG_BUSY
+            10151,  # WINDOW_DIALOG_EXT_PROGRESS
+            10160,  # WINDOW_DIALOG_BUSY_NOCANCEL
+            12000,  # WINDOW_DIALOG_SELECT
+            12002,  # WINDOW_DIALOG_OK
+    ))):
+        if all_modals and xbmc.getCondVisibility('System.HasActiveModalDialog'):
+            return True
+        dialog_id = xbmcgui.getCurrentWindowDialogId()
+        if dialog_id in dialog_ids:
+            return dialog_id
+        return False
+
+    @staticmethod
     def is_plugin_container(url='plugin://{0}/'.format(ADDON_ID),
                             check_all=False,
                             _bool=xbmc.getCondVisibility,
+                            _busy=busy_dialog_active.__func__,
                             _label=xbmc.getInfoLabel):
         if check_all:
             return (not _bool('Container.IsUpdating')
-                    and not _bool('System.HasActiveModalDialog')
+                    and not _busy()
                     and _label('Container.FolderPath').startswith(url))
         is_plugin = _label('Container.FolderPath').startswith(url)
         return {
             'is_plugin': is_plugin,
             'is_loaded': is_plugin and not _bool('Container.IsUpdating'),
-            'is_active': is_plugin and not _bool('System.HasActiveModalDialog'),
+            'is_active': is_plugin and not _busy(),
         }
 
-    @staticmethod
-    def set_property(property_id, value='true'):
-        property_id = '-'.join((ADDON_ID, property_id))
-        xbmcgui.Window(10000).setProperty(property_id, value)
+    def clear_property(self, property_id):
+        self._context.log_debug('Clear property |{id}|'.format(id=property_id))
+        _property_id = '-'.join((ADDON_ID, property_id))
+        xbmcgui.Window(10000).clearProperty(_property_id)
+        return None
+
+    def set_property(self, property_id, value='true'):
+        self._context.log_debug('Set property |{id}|: {value!r}'
+                                .format(id=property_id, value=value))
+        _property_id = '-'.join((ADDON_ID, property_id))
+        xbmcgui.Window(10000).setProperty(_property_id, value)
         return value
 
     def refresh_container(self, force=False):
@@ -102,7 +132,9 @@ class ServiceMonitor(xbmc.Monitor):
                 'GUI.OnDPMSDeactivated',
                 'System.OnWake',
             }:
-                self.onWake()
+                self.system_idle = False
+                self.system_sleep = False
+                self.interrupt = True
 
             elif method == 'Player.OnPlay':
                 player = xbmc.Player()
@@ -111,9 +143,27 @@ class ServiceMonitor(xbmc.Monitor):
                     if playing_file.path in {PATHS.MPD,
                                              PATHS.PLAY,
                                              PATHS.REDIRECT}:
-                        self.onWake()
+                        if not self.httpd:
+                            self.start_httpd()
+                        if self.httpd_sleep_allowed:
+                            self.httpd_sleep_allowed = None
                 except RuntimeError:
                     pass
+
+            elif method == 'Playlist.OnAdd':
+                context = self._context
+
+                data = json.loads(data)
+                position = data.get('position', 0)
+                item_path = context.get_infolabel(
+                    'Player.position({0}).FilenameAndPath'.format(position)
+                )
+
+                if context.is_plugin_path(item_path):
+                    if not context.is_plugin_path(item_path, PATHS.PLAY):
+                        context.log_warning('Playlist.OnAdd - non-playable path'
+                                            '\n\tPath: {0}'.format(item_path))
+                        self.set_property(PLAY_FORCED)
 
             return
 
@@ -131,6 +181,8 @@ class ServiceMonitor(xbmc.Monitor):
             target = data.get('target')
 
             if target == PLUGIN_WAKEUP:
+                self.system_idle = False
+                self.system_sleep = False
                 self.interrupt = True
                 response = True
 
@@ -170,6 +222,15 @@ class ServiceMonitor(xbmc.Monitor):
         elif event == RELOAD_ACCESS_MANAGER:
             self._context.reload_access_manager()
             self.refresh_container()
+
+        elif event == PLAYBACK_STOPPED:
+            if data:
+                data = json.loads(data)
+            if not data:
+                return
+
+            if data.get('play_data', {}).get('play_count'):
+                self.set_property(PLAYER_VIDEO_ID, data.get('video_id'))
 
     def onSettingsChanged(self, force=False):
         context = self._context
@@ -227,17 +288,7 @@ class ServiceMonitor(xbmc.Monitor):
             else:
                 self.start_httpd()
         elif httpd_started:
-            self.shutdown_httpd()
-
-    def onWake(self):
-        self.system_idle = False
-        self.system_sleep = False
-        self.interrupt = True
-
-        if not self.httpd and self.httpd_required():
-            self.start_httpd()
-        if self.httpd_sleep_allowed:
-            self.httpd_sleep_allowed = None
+            self.shutdown_httpd(terminate=True)
 
     def httpd_address_sync(self):
         self._old_httpd_address = self._httpd_address
@@ -271,33 +322,33 @@ class ServiceMonitor(xbmc.Monitor):
         self._httpd_error = False
         return True
 
-    def shutdown_httpd(self):
-        if self.httpd:
-            if (not self.system_sleep
-                    and self.system_idle
-                    and self.httpd_required(while_idle=True)):
-                return
-            self._context.log_debug('HTTPServer: Shutting down |{ip}:{port}|'
-                                    .format(ip=self._old_httpd_address,
-                                            port=self._old_httpd_port))
-            self.httpd_address_sync()
+    def shutdown_httpd(self, on_idle=False, terminate=False, player=None):
+        if (not self.httpd
+                or (not (terminate or self.system_sleep)
+                    and (on_idle or self.system_idle)
+                    and self.httpd_required(on_idle=True, player=player))):
+            return
+        self._context.log_debug('HTTPServer: Shutting down |{ip}:{port}|'
+                                .format(ip=self._old_httpd_address,
+                                        port=self._old_httpd_port))
+        self.httpd_address_sync()
 
-            shutdown_thread = threading.Thread(target=self.httpd.shutdown)
-            shutdown_thread.daemon = True
-            shutdown_thread.start()
+        shutdown_thread = threading.Thread(target=self.httpd.shutdown)
+        shutdown_thread.daemon = True
+        shutdown_thread.start()
 
-            for thread in (self.httpd_thread, shutdown_thread):
-                if not thread.is_alive():
-                    continue
-                try:
-                    thread.join(5)
-                except RuntimeError:
-                    pass
+        for thread in (self.httpd_thread, shutdown_thread):
+            if not thread.is_alive():
+                continue
+            try:
+                thread.join(2)
+            except RuntimeError:
+                pass
 
-            self.httpd.server_close()
+        self.httpd.server_close()
 
-            self.httpd_thread = None
-            self.httpd = None
+        self.httpd_thread = None
+        self.httpd = None
 
     def restart_httpd(self):
         self._context.log_debug('HTTPServer: Restarting'
@@ -306,15 +357,15 @@ class ServiceMonitor(xbmc.Monitor):
                                         old_port=self._old_httpd_port,
                                         ip=self._httpd_address,
                                         port=self._httpd_port))
-        self.shutdown_httpd()
+        self.shutdown_httpd(terminate=True)
         self.start_httpd()
 
     def ping_httpd(self):
         return self.httpd and httpd_status(self._context)
 
-    def httpd_required(self, settings=None, while_idle=False):
+    def httpd_required(self, settings=None, on_idle=False, player=None):
         if settings:
-            required = (settings.use_isa()
+            required = (settings.use_mpd_videos()
                         or settings.api_config_page()
                         or settings.support_alternative_player())
             self._use_httpd = required
@@ -322,10 +373,15 @@ class ServiceMonitor(xbmc.Monitor):
         elif self._httpd_error:
             required = False
 
-        elif while_idle:
+        elif on_idle:
             settings = self._context.get_settings()
-            required = (settings.api_config_page()
-                        or settings.support_alternative_player())
+
+            playing = player.isPlaying() if player else False
+            external = player.isExternalPlayer() if playing else False
+
+            required = ((playing and settings.use_mpd_videos())
+                        or settings.api_config_page()
+                        or (external and settings.support_alternative_player()))
 
         else:
             required = self._use_httpd

@@ -54,16 +54,14 @@ class BaseItem(object):
         self._dateadded = None
         self._short_details = None
         self._production_code = None
+        self._track_number = None
 
         self._cast = None
         self._artists = None
         self._studios = None
 
     def __str__(self):
-        return ('{type}'
-                '\n\tName:  |{name}|'
-                '\n\tURI:   |{uri}|'
-                '\n\tImage: |image}|'
+        return ('{type}(name="{name}", uri="{uri}", image="{image}")'
                 .format(type=self.__class__.__name__,
                         name=self._name,
                         uri=self._uri,
@@ -338,6 +336,12 @@ class BaseItem(object):
 
     def get_production_code(self):
         return self._production_code
+
+    def set_track_number(self, track_number):
+        self._track_number = int(track_number)
+
+    def get_track_number(self):
+        return self._track_number
 
 
 class _Encoder(json.JSONEncoder):

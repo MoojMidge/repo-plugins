@@ -17,8 +17,8 @@ from ..utils import (
     current_system_version,
     get_kodi_setting_bool,
     get_kodi_setting_value,
-    validate_ip_address,
 )
+from ..network.http_server import validate_ip_address
 
 
 class AbstractSettings(object):
@@ -104,21 +104,23 @@ class AbstractSettings(object):
         return self.get_int(SETTINGS.SEARCH_SIZE, 10)
 
     def setup_wizard_enabled(self, value=None):
-        # Increment min_required on new release to enable oneshot on first run
-        min_required = 5
+        # Set run_required to release date (as Unix timestamp in seconds)
+        # to enable oneshot on first run
+        # Tuesday, 8 April 2025 12:00:00 AM = 1744070400
+        run_required = 1744070400
 
         if value is False:
-            self.set_int(SETTINGS.SETUP_WIZARD_RUNS, min_required)
+            self.set_int(SETTINGS.SETUP_WIZARD_RUNS, run_required)
             return self.set_bool(SETTINGS.SETUP_WIZARD, False)
         if value is True:
             self.set_int(SETTINGS.SETUP_WIZARD_RUNS, 0)
             return self.set_bool(SETTINGS.SETUP_WIZARD, True)
 
-        forced_runs = self.get_int(SETTINGS.SETUP_WIZARD_RUNS, 0)
-        if forced_runs < min_required:
-            self.set_int(SETTINGS.SETUP_WIZARD_RUNS, min_required)
+        last_run = self.get_int(SETTINGS.SETUP_WIZARD_RUNS, 0)
+        if last_run < run_required:
+            self.set_int(SETTINGS.SETUP_WIZARD_RUNS, run_required)
             self.set_bool(SETTINGS.SETTINGS_END, True)
-            return True
+            return run_required
         return self.get_bool(SETTINGS.SETUP_WIZARD, False)
 
     def support_alternative_player(self, value=None):
@@ -137,15 +139,15 @@ class AbstractSettings(object):
         if value is not None:
             return self.set_bool(SETTINGS.ALTERNATIVE_PLAYER_WEB_URLS, value)
         if (self.support_alternative_player()
-                and not self.alternative_player_adaptive()):
+                and not self.alternative_player_mpd()):
             return self.get_bool(SETTINGS.ALTERNATIVE_PLAYER_WEB_URLS, False)
         return False
 
-    def alternative_player_adaptive(self, value=None):
+    def alternative_player_mpd(self, value=None):
         if value is not None:
-            return self.set_bool(SETTINGS.ALTERNATIVE_PLAYER_ADAPTIVE, value)
+            return self.set_bool(SETTINGS.ALTERNATIVE_PLAYER_MPD, value)
         if self.support_alternative_player():
-            return self.get_bool(SETTINGS.ALTERNATIVE_PLAYER_ADAPTIVE, False)
+            return self.get_bool(SETTINGS.ALTERNATIVE_PLAYER_MPD, False)
         return False
 
     def use_isa(self, value=None):
@@ -388,10 +390,10 @@ class AbstractSettings(object):
 
     def live_stream_type(self, value=None):
         if self.use_isa():
-            default = 2
+            default = 3
             setting = SETTINGS.LIVE_STREAMS + '.1'
         else:
-            default = 0
+            default = 1
             setting = SETTINGS.LIVE_STREAMS + '.2'
         if value is not None:
             return self.set_int(setting, value)
@@ -428,7 +430,7 @@ class AbstractSettings(object):
         return port
 
     def httpd_listen(self, value=None):
-        default = '0.0.0.0'
+        default = '127.0.0.1'
 
         if value is None:
             ip_address = self.get_string(SETTINGS.HTTPD_LISTEN, default)
@@ -457,6 +459,11 @@ class AbstractSettings(object):
         if value is not None:
             return self.set_bool(SETTINGS.HTTPD_IDLE_SLEEP, value)
         return self.get_bool(SETTINGS.HTTPD_IDLE_SLEEP, True)
+
+    def httpd_stream_redirect(self, value=None):
+        if value is not None:
+            return self.set_bool(SETTINGS.HTTPD_STREAM_REDIRECT, value)
+        return self.get_bool(SETTINGS.HTTPD_STREAM_REDIRECT, False)
 
     def api_config_page(self):
         return self.get_bool(SETTINGS.API_CONFIG_PAGE, False)
@@ -573,32 +580,66 @@ class AbstractSettings(object):
         'premieres': True,
         'completed': True,
         'vod': True,
+        'custom': None,
     }
 
-    def item_filter(self, update=None, override=None):
-        types = dict.fromkeys(
-            self.get_string_list(SETTINGS.HIDE_VIDEOS)
-            if override is None else
-            override,
-            False
-        )
-        types = dict(self._DEFAULT_FILTER, **types)
+    def item_filter(self, update=None, override=None, exclude=None):
+        if override is None:
+            override = self.get_string_list(SETTINGS.HIDE_VIDEOS)
+            override = dict.fromkeys(override, False)
+            override['custom'] = (self.get_string(SETTINGS.FILTER_LIST)
+                                  .split(','))
+        elif isinstance(override, (list, tuple)):
+            _override = {'custom': []}
+            for value in override:
+                if value in self._DEFAULT_FILTER:
+                    _override[value] = False
+                else:
+                    _override['custom'].append(value)
+            override = _override
+        types = dict(self._DEFAULT_FILTER, **override)
+
         if update:
             if 'live_folder' in update:
-                if 'live_folder' in types:
-                    types.update(update)
-                else:
-                    types.update({
-                        'upcoming': True,
-                        'upcoming_live': True,
-                        'live': True,
-                        'premieres': True,
-                        'completed': True,
-                    })
-                types['vod'] = False
-            else:
-                types.update(update)
+                if 'live_folder' not in types:
+                    update.update((
+                        ('vod', False),
+                        ('upcoming', True),
+                        ('upcoming_live', True),
+                        ('live', True),
+                        ('premieres', True),
+                        ('completed', True),
+                    ))
+            types.update(update)
+
+        if exclude:
+            types['exclude'] = exclude
+
         return types
+
+    def subscriptions_filter_enabled(self, value=None):
+        if value is not None:
+            return self.set_bool(SETTINGS.SUBSCRIPTIONS_FILTER_ENABLED, value)
+        return self.get_bool(SETTINGS.SUBSCRIPTIONS_FILTER_ENABLED, True)
+
+    def subscriptions_filter_blacklist(self, value=None):
+        if value is not None:
+            return self.set_bool(SETTINGS.SUBSCRIPTIONS_FILTER_BLACKLIST, value)
+        return self.get_bool(SETTINGS.SUBSCRIPTIONS_FILTER_BLACKLIST, True)
+
+    def subscriptions_filter(self, value=None):
+        if value is not None:
+            if isinstance(value, (list, tuple, set)):
+                value = ','.join(value).lstrip(',')
+            return self.set_string(SETTINGS.SUBSCRIPTIONS_FILTER_LIST, value)
+        return self.get_string(
+            SETTINGS.SUBSCRIPTIONS_FILTER_LIST, ''
+        ).replace(', ', ',')
+
+    def shorts_duration(self, value=None):
+        if value is not None:
+            return self.set_int(SETTINGS.SHORTS_DURATION, value)
+        return self.get_int(SETTINGS.SHORTS_DURATION, 60)
 
     def show_detailed_description(self, value=None):
         if value is not None:
@@ -661,5 +702,5 @@ class AbstractSettings(object):
         return frozenset(self.get_string_list(SETTINGS.CHANNEL_NAME_ALIASES))
 
     def logging_enabled(self):
-        return (self.get_bool(SETTINGS.LOGGING_ENABLED, False)
+        return (self.get_int(SETTINGS.LOGGING_ENABLED, 0)
                 or get_kodi_setting_bool('debug.showloginfo'))

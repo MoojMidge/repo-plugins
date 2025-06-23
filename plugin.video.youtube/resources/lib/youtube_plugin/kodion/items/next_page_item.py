@@ -12,6 +12,7 @@ from __future__ import absolute_import, division, unicode_literals
 
 from . import menu_items
 from .directory_item import DirectoryItem
+from ..constants import PATHS
 
 
 class NextPageItem(DirectoryItem):
@@ -20,17 +21,30 @@ class NextPageItem(DirectoryItem):
             del params['refresh']
 
         path = context.get_path()
-        page = params.get('page', 2)
-        items_per_page = params.get('items_per_page', 50)
+        page = params.get('page') or 2
+        items_per_page = params.get('items_per_page') or 50
         can_jump = ('next_page_token' not in params
                     and not path.startswith(('/channel',
-                                             '/special/recommendations',
-                                             '/special/related_videos')))
+                                             PATHS.RECOMMENDATIONS,
+                                             PATHS.RELATED_VIDEOS)))
+        can_search = not path.startswith(PATHS.SEARCH)
         if 'page_token' not in params and can_jump:
             params['page_token'] = self.create_page_token(page, items_per_page)
 
+        name = context.localize('page.next') % page
+        filtered = params.get('filtered')
+        if filtered:
+            name = ''.join((
+                name,
+                ' (',
+                str(filtered),
+                ' ',
+                context.localize('filtered'),
+                ')',
+            ))
+
         super(NextPageItem, self).__init__(
-            context.localize('page.next') % page,
+            name,
             context.create_uri(path, params),
             image=image,
             fanart=fanart,
@@ -44,7 +58,7 @@ class NextPageItem(DirectoryItem):
             menu_items.refresh(context),
             menu_items.goto_page(context, params) if can_jump else None,
             menu_items.goto_home(context),
-            menu_items.goto_quick_search(context),
+            menu_items.goto_quick_search(context) if can_search else None,
         ]
         self.add_context_menu(context_menu)
 

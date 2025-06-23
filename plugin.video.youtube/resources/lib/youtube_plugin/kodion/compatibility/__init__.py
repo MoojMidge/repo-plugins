@@ -10,6 +10,7 @@
 __all__ = (
     'BaseHTTPRequestHandler',
     'TCPServer',
+    'ThreadingMixIn',
     'available_cpu_count',
     'byte_string_type',
     'datetime_infolabel',
@@ -17,10 +18,13 @@ __all__ = (
     'parse_qs',
     'parse_qsl',
     'quote',
+    'quote_plus',
+    'range_type',
     'string_type',
     'to_str',
     'unescape',
     'unquote',
+    'unquote_plus',
     'urlencode',
     'urljoin',
     'urlsplit',
@@ -36,12 +40,14 @@ __all__ = (
 try:
     from html import unescape
     from http.server import BaseHTTPRequestHandler
-    from socketserver import TCPServer
+    from socketserver import TCPServer, ThreadingMixIn
     from urllib.parse import (
         parse_qs,
         parse_qsl,
         quote,
+        quote_plus,
         unquote,
+        unquote_plus,
         urlencode,
         urljoin,
         urlsplit,
@@ -58,8 +64,10 @@ try:
     xbmc.LOGNOTICE = xbmc.LOGINFO
     xbmc.LOGSEVERE = xbmc.LOGFATAL
 
-    string_type = str
+    range_type = (range, list)
+
     byte_string_type = bytes
+    string_type = str
     to_str = str
 
 
@@ -76,11 +84,13 @@ try:
 # Compatibility shims for Kodi v18 and Python v2.7
 except ImportError:
     from BaseHTTPServer import BaseHTTPRequestHandler
-    from contextlib import contextmanager as _contextmanager
-    from SocketServer import TCPServer
+    from contextlib import contextmanager
+    from SocketServer import TCPServer, ThreadingMixIn
     from urllib import (
         quote as _quote,
+        quote_plus as _quote_plus,
         unquote as _unquote,
+        unquote_plus as _unquote_plus,
         urlencode as _urlencode,
     )
     from urlparse import (
@@ -105,8 +115,16 @@ except ImportError:
         return _quote(to_str(data), *args, **kwargs)
 
 
+    def quote_plus(data, *args, **kwargs):
+        return _quote_plus(to_str(data), *args, **kwargs)
+
+
     def unquote(data):
         return _unquote(to_str(data))
+
+
+    def unquote_plus(data):
+        return _unquote_plus(to_str(data))
 
 
     def urlencode(data, *args, **kwargs):
@@ -125,7 +143,7 @@ except ImportError:
     _File = xbmcvfs.File
 
 
-    @_contextmanager
+    @contextmanager
     def _file_closer(*args, **kwargs):
         file = None
         try:
@@ -139,8 +157,10 @@ except ImportError:
     xbmcvfs.File = _file_closer
     xbmcvfs.translatePath = xbmc.translatePath
 
-    string_type = basestring
+    range_type = (xrange, list)
+
     byte_string_type = (bytes, str)
+    string_type = basestring
 
 
     def to_str(value):
